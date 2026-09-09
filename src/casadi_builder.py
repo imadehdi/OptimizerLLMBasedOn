@@ -153,6 +153,11 @@ class CasadiProblemBuilder:
         col_map_case = {str(c).lower(): c for c in df_data.columns}
 
         for cstr in config_constraints:
+            # === ANTICIPATION PYMOO ===
+            if not cstr.get("is_strict", True):
+                continue # On ignore les soft constraints, elles ne vont pas dans le solveur dur
+            # ==========================
+
             lb, ub = parse_casadi_bounds(cstr)
             attribute_lower = cstr.get("attribute", "").lower()
             current_var = self.vars.get(cstr.get("applied_to", "x"), self.vars.get("x"))

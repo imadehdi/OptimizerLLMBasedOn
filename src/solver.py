@@ -20,6 +20,11 @@ def build_ilp_constraints(constraints_config, n_rows, df_data):
     col_map_case = {str(c).lower(): c for c in df_data.columns} if df_data is not None else {}
 
     for cstr in constraints_config:
+        # === ANTICIPATION PYMOO ===
+        if not cstr.get("is_strict", True):
+            continue 
+        # ==========================
+        
         if cstr.get("constraint_family") == "cardinality":
             attr = cstr.get("attribute", "").lower()
             min_bound, max_bound = parse_ilp_bounds(cstr)

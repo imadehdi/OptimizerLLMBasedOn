@@ -26,8 +26,8 @@ class ObjectiveConfig(BaseModel):
     variable_name: str = "x"
     direction: Literal["min", "max"] = "min"
     
-    target_1: Optional[Dict[str, Any]] = Field(default=None, description="Premier objectif (ex: Maximiser le rendement)")
-    target_2: Optional[Dict[str, Any]] = Field(default=None, description="Deuxième objectif (ex: Minimiser le risque)")
+    target_1: Optional[Dict[str, Any]] = Field(default=None, description="Premier objectif")
+    target_2: Optional[Dict[str, Any]] = Field(default=None, description="Deuxième objectif")
     points: int = Field(default=20, description="Nombre de portefeuilles à générer sur la frontière")
     highlight_metric: Optional[str] = Field(default="", description="The specific metric to highlight on a Pareto frontier.")
 
@@ -40,6 +40,7 @@ class GenericConstraint(BaseModel):
     applied_to: str = Field(..., description="Nom de la variable de décision impactée (ex: 'x' ou 'b')")
     attribute: str = Field(..., description="Nom exact de la colonne du tableau, ou 'sum_all', ou 'element'")
     constraint_family: Literal["standard", "cardinality", "logic", "min_buy_in"] = Field(default="standard", description="Famille algorithmique de la contrainte")
+    is_strict: bool = Field(default=True, description="True si c'est une contrainte dure (Hard), False si c'est un compromis/objectif (Soft).")
     targets: List[str] = Field(default_factory=list, description="Valeurs textuelles ciblées si colonne catégorielle.")
     bound_type: Literal["eq", "max", "min", "range"]
     value: Optional[float] = None
