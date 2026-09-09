@@ -18,26 +18,131 @@ class CasadiProblemBuilder:
     def __init__(self, n_rows: int):
         self.n_rows = n_rows
         self.vars = {} 
+        self.binary_vars_names = [] 
+        self.base_objective = 0
         self.objective = 0
         self.g_exprs, self.lbg, self.ubg = [], [], []
         self.lbx, self.ubx = [], [] 
+        self.var_indices = {} 
+        self._current_var_idx = 0
 
     def create_variables(self, decision_variables_config: list):
-        """Instancie les variables symboliques demandées par l'IA."""
         for var in decision_variables_config:
             name = var["name"]
-            if var["size"] == "n_rows":
-                self.vars[name] = ca.MX.sym(name, self.n_rows)
-                self.lbx.extend([0.0] * self.n_rows) # Bornes par défaut (Positivité)
-                self.ubx.extend([1.0] * self.n_rows) 
-            elif var["size"] == "scalar":
-                self.vars[name] = ca.MX.sym(name, 1)
-                self.lbx.append(-ca.inf)
-                self.ubx.append(ca.inf)
+            size = self.n_rows if var["size"] == "n_rows" else 1
+            
+            self.vars[name] = ca.MX.sym(name, size)
+            self.var_indices[name] = (self._current_var_idx, self._current_var_idx + size)
+            self._current_var_idx += size
+            
+            if var["type"] in ["binary", "integer"]:
+                self.lbx.extend([0.0] * size)
+                self.ubx.extend([1.0] * size)
+                self.binary_vars_names.append(name)
+            else:
+                self.lbx.extend([0.0] * size if name == "x" else [-ca.inf] * size)
+                self.ubx.extend([1.0] * size if name == "x" else [ca.inf] * size)
 
-    def set_objective(self, expr, sense="min"):
-        if sense == "max": self.objective = -expr
-        else: self.objective = expr
+    def build_objective(self, obj_config: dict, matrix_inputs: dict, df_data: pd.DataFrame):
+        obj_type = obj_config.get("type")
+        target_name = obj_config.get("target_name")         
+        secondary_target_name = obj_config.get("secondary_target_name") 
+        var_name = obj_config.get("variable_name", "x")     
+        direction = obj_config.get("direction", "min")       
+        
+        current_var = self.vars.get(var_name, self.vars.get("x"))
+        eps = 1e-5
+
+        if obj_type == "quadratic":
+            matrix_dm = ca.DM(matrix_inputs[target_name]) 
+            obj_expr = ca.mtimes(ca.mtimes(current_var.T, matrix_dm), current_var)
+            
+        elif obj_type == "linear":
+            objective_vector = df_data[target_name].values.reshape(1, -1)
+            obj_expr = ca.mtimes(objective_vector, current_var)
+            
+        elif obj_type == "tracking_error":
+            matrix_dm = ca.DM(matrix_inputs[target_name]) 
+            xb_vector = ca.DM(matrix_inputs.get("Benchmark", [0.0] * self.n_rows))
+            active_weights = current_var - xb_vector
+            obj_expr = ca.mtimes(ca.mtimes(active_weights.T, matrix_dm), active_weights)
+
+        elif obj_type == "ratio":
+            return_vector = df_data[target_name].values.reshape(1, -1)
+            lin_return_expr = ca.mtimes(return_vector, current_var)
+            matrix_dm = ca.DM(matrix_inputs[secondary_target_name])
+            variance_expr = ca.mtimes(ca.mtimes(current_var.T, matrix_dm), current_var)
+            obj_expr = lin_return_expr / ca.sqrt(variance_expr + eps)
+
+        elif obj_type == "minimax":
+            scenarios_matrix = ca.DM(matrix_inputs[target_name])
+            scenario_values = ca.mtimes(scenarios_matrix, current_var)
+            obj_expr = 0.005 * ca.log(ca.sum1(ca.exp(scenario_values / 0.005)))
+
+        elif obj_type == "mad":
+            scenarios_np = np.array(matrix_inputs[target_name])
+            T_scenarios = scenarios_np.shape[0]
+            mean_vector = np.mean(scenarios_np, axis=0).reshape(1, -1)
+            deviations_np = scenarios_np - mean_vector
+            portfolio_deviations = ca.mtimes(ca.DM(deviations_np), current_var)
+            obj_expr = ca.sum1(ca.sqrt(portfolio_deviations**2 + eps)) / T_scenarios
+
+        elif obj_type == "turnover":
+            x0_vector = ca.DM(matrix_inputs.get("x0", [0.0]*self.n_rows))
+            diff = current_var - x0_vector
+            obj_expr = ca.sum1(ca.sqrt(diff**2 + eps))
+
+        elif obj_type == "risk_budgeting":
+            matrix_dm = ca.DM(matrix_inputs[target_name])
+            budgets = ca.DM(matrix_inputs.get("Budgets", [1.0 / self.n_rows] * self.n_rows)) 
+            variance_expr = ca.mtimes(ca.mtimes(current_var.T, matrix_dm), current_var)
+            marginal_risk = ca.mtimes(matrix_dm, current_var)
+            risk_contribution = current_var * marginal_risk
+            target_contribution = budgets * variance_expr
+            obj_expr = ca.sum1((risk_contribution - target_contribution)**2)
+            
+        elif obj_type == "cvar":
+            scenarios_matrix = ca.DM(matrix_inputs[target_name])
+            T_scenarios = scenarios_matrix.shape[0]
+            beta = 0.95
+            
+            alpha = ca.MX.sym('alpha', 1) 
+            u = ca.MX.sym('u', T_scenarios) 
+            
+            self.vars['alpha'] = alpha
+            self.vars['u'] = u
+            self.lbx.append(-ca.inf)
+            self.ubx.append(ca.inf)
+            self.lbx.extend([0.0] * T_scenarios) 
+            self.ubx.extend([ca.inf] * T_scenarios)
+            
+            self.var_indices['alpha'] = (self._current_var_idx, self._current_var_idx + 1)
+            self._current_var_idx += 1
+            self.var_indices['u'] = (self._current_var_idx, self._current_var_idx + T_scenarios)
+            self._current_var_idx += T_scenarios
+            
+            portfolio_losses = ca.mtimes(scenarios_matrix, current_var)
+            for t in range(T_scenarios):
+                self.add_constraint(u[t] + alpha - portfolio_losses[t], 0.0, ca.inf)
+                
+            obj_expr = alpha + (1.0 / (T_scenarios * (1.0 - beta))) * ca.sum1(u)
+
+        else:
+            obj_expr = ca.sum1(current_var) 
+
+        if direction == "max": obj_expr = -obj_expr
+        self.base_objective = obj_expr
+        self.objective = self.base_objective
+
+    def add_alm_penalty(self, lambda_mult: float, mu_val: float):
+        penalty_expr = 0
+        for b_name in self.binary_vars_names:
+            b_var = self.vars[b_name]
+            penalty_expr += ca.sum1(b_var * (1.0 - b_var))
+        self.objective = self.base_objective + lambda_mult * penalty_expr
+
+    def remove_alm_penalty(self):
+        self.objective = self.base_objective
 
     def add_constraint(self, expr, lb, ub):
         self.g_exprs.append(expr)
@@ -49,69 +154,35 @@ class CasadiProblemBuilder:
 
         for cstr in config_constraints:
             lb, ub = parse_casadi_bounds(cstr)
-            attribute_raw = cstr.get("attribute", "")
-            attribute_lower = attribute_raw.lower()
-            
-            var_name = cstr.get("applied_to", "x")
-            if var_name not in self.vars: var_name = "x"
-            current_var = self.vars[var_name]
+            attribute_lower = cstr.get("attribute", "").lower()
+            current_var = self.vars.get(cstr.get("applied_to", "x"), self.vars.get("x"))
+            family = cstr.get("constraint_family", "standard")
 
-            # 1. Contrainte de Somme
+            if family == "cardinality":
+                continue
+
             if attribute_lower in ["sum_all", "sum", "somme", "total"]:
                 self.add_constraint(ca.sum1(current_var), lb, ub)
                 continue
                 
-            # 2. Contrainte Élémentaire (Plafond simple)
             if attribute_lower == "element":
                 self.g_exprs.append(current_var)
                 self.lbg.extend([lb] * self.n_rows)
                 self.ubg.extend([ub] * self.n_rows)
                 continue
             
-            # 3. NOUVEAU : Minimum Buy-in (Big-M)
-            if attribute_lower == "min_buy_in":
-                # On suppose que 'b' existe dans self.vars
-                if "b" not in self.vars:
-                    print("Warning: min_buy_in demandé mais 'b' est absent.")
-                    continue
-                b_var = self.vars["b"]
-                min_val = cstr.get("min_value", 0.0) # Le seuil L (ex: 0.03)
-                # x - b <= 0  => x <= b
-                # x - L*b >= 0 => x >= L*b
+            if family == "min_buy_in":
+                b_var = self.vars.get("b")
+                if b_var is None: continue
+                min_val = cstr.get("min_value", 0.0) 
                 for i in range(self.n_rows):
                     self.add_constraint(current_var[i] - b_var[i], -ca.inf, 0.0)
                     self.add_constraint(current_var[i] - min_val * b_var[i], 0.0, ca.inf)
                 continue
 
-            # 4. Vérification colonne
-            if attribute_lower not in col_map_case:
-                continue
-            real_col_name = col_map_case[attribute_lower]
-
-            # ... (laisser le reste de la fonction inchangé pour les autres contraintes)
-            if pd.api.types.is_numeric_dtype(df_data[real_col_name]):
-                exposure_vector = df_data[real_col_name].values.reshape(1, -1)
-                exposure_expr = ca.mtimes(exposure_vector, current_var)
-                self.add_constraint(exposure_expr, lb, ub)
-            else:
-                all_dummies = pd.get_dummies(df_data[real_col_name], dtype=float)
-                val_map = {str(c).lower(): c for c in all_dummies.columns}
-                targets = cstr.get("targets") or []
-                targets_lower = [str(t).lower() for t in targets]
-                
-                if not targets or "all" in targets_lower:
-                    exposure_matrix = all_dummies.values
-                    n_c = exposure_matrix.shape[1]
-                else:
-                    valid_targets = [val_map[t_low] for t_low in targets_lower if t_low in val_map]
-                    if not valid_targets: continue
-                    exposure_matrix = all_dummies[valid_targets].values
-                    n_c = len(valid_targets)
-                    
-                group_exposures = ca.mtimes(exposure_matrix.T, current_var)
-                self.lbg.extend([lb] * n_c)
-                self.ubg.extend([ub] * n_c)
-                self.g_exprs.append(group_exposures)
+            if attribute_lower in col_map_case and pd.api.types.is_numeric_dtype(df_data[col_map_case[attribute_lower]]):
+                exposure_vector = df_data[col_map_case[attribute_lower]].values.reshape(1, -1)
+                self.add_constraint(ca.mtimes(exposure_vector, current_var), lb, ub)
 
     def build_nlp(self) -> dict:
         g = ca.vertcat(*self.g_exprs) if self.g_exprs else ca.MX()

@@ -29,18 +29,17 @@ class ObjectiveConfig(BaseModel):
     target_1: Optional[Dict[str, Any]] = Field(default=None, description="Premier objectif (ex: Maximiser le rendement)")
     target_2: Optional[Dict[str, Any]] = Field(default=None, description="Deuxième objectif (ex: Minimiser le risque)")
     points: int = Field(default=20, description="Nombre de portefeuilles à générer sur la frontière")
-    
-    # AJOUT : L'intention analytique du LLM
-    highlight_metric: Optional[str] = Field(default="", description="The specific metric to highlight on a Pareto frontier (e.g., 'sharpe', 'knee_point', 'min_risk', 'max_return').")
+    highlight_metric: Optional[str] = Field(default="", description="The specific metric to highlight on a Pareto frontier.")
 
 class DecisionVariable(BaseModel):
-    name: str = Field(..., description="Nom symbolique de la variable (ex: 'x')")
+    name: str = Field(..., description="Nom symbolique de la variable (ex: 'x' ou 'b')")
     size: Literal["n_rows", "scalar"] = Field(..., description="Taille de la variable")
     type: Literal["continuous", "binary", "integer"] = Field(default="continuous", description="Domaine mathématique de la variable")
 
 class GenericConstraint(BaseModel):
     applied_to: str = Field(..., description="Nom de la variable de décision impactée (ex: 'x' ou 'b')")
     attribute: str = Field(..., description="Nom exact de la colonne du tableau, ou 'sum_all', ou 'element'")
+    constraint_family: Literal["standard", "cardinality", "logic", "min_buy_in"] = Field(default="standard", description="Famille algorithmique de la contrainte")
     targets: List[str] = Field(default_factory=list, description="Valeurs textuelles ciblées si colonne catégorielle.")
     bound_type: Literal["eq", "max", "min", "range"]
     value: Optional[float] = None
