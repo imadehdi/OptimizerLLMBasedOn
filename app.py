@@ -1,291 +1,344 @@
-import os
-import json
-import time
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 import plotly.express as px
-from dotenv import load_dotenv
 
-from src.agent_formulator import FormulationAgent
 from src.agent_executor import OptimizationExecutor
 
-st.set_page_config(
-    page_title="AI Optimization Engine",
-    page_icon=None,
-    layout="wide"
-)
+# ==========================================
+# 0. CONFIGURATION & MOCK DATA
+# ==========================================
+st.set_page_config(page_title="Portfolio Optimization Engine", layout="wide")
 
-load_dotenv()
-
-model_name = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
-ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-
-# ============================================================
-# INITIALISATION DE LA MEMOIRE (CHAT HISTORY)
-# ============================================================
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": "Welcome! Upload your data in the sidebar, and let me know how you want to optimize your portfolio."
-        }
-    ]
-
-# ============================================================
-# SIDEBAR : CONFIGURATION ET DONNEES
-# ============================================================
-with st.sidebar:
-    st.header("Configuration")
-
-    st.subheader("1. Data Upload")
-    uploaded_file = st.file_uploader("Select an Excel file (.xlsx)", type=["xlsx"])
-
-    df_data = None
-    matrix_inputs = {}
-
-    if uploaded_file is not None:
-        excel_file = pd.ExcelFile(uploaded_file)
-        sheet_names = excel_file.sheet_names
-        
-        if "Donnees_Actifs" in sheet_names:
-            df_data = pd.read_excel(uploaded_file, sheet_name="Donnees_Actifs")
-        else:
-            df_data = pd.read_excel(uploaded_file, sheet_name=0)
-            
-        n_rows = len(df_data)
-        st.success(f"{n_rows} assets loaded.")
-
-        if "Matrice_Covariance" in sheet_names:
-            df_cov = pd.read_excel(uploaded_file, sheet_name="Matrice_Covariance")
-            # Force la sélection des colonnes numériques uniquement pour ignorer les titres/labels
-            numeric_cov = df_cov.select_dtypes(include=[np.number])
-            matrix_inputs["Sigma"] = numeric_cov.values.tolist()
-            st.caption("Covariance matrix loaded.")
-        
-        if "Benchmark" in sheet_names:
-            df_bench = pd.read_excel(uploaded_file, sheet_name="Benchmark")
-            # On ne garde que les nombres pour éviter les crashs de typage
-            numeric_bench = df_bench.select_dtypes(include=[np.number])
-            # On convertit la colonne en une liste plate (1D)
-            matrix_inputs["Benchmark"] = numeric_bench.values.flatten().tolist()
-            st.caption("Benchmark weights loaded.")
-
-
-        if "Matrice_Scenarios" in sheet_names:
-            df_scenarios = pd.read_excel(uploaded_file, sheet_name="Matrice_Scenarios")
-            # Force la sélection des colonnes numériques uniquement
-            numeric_scenarios = df_scenarios.select_dtypes(include=[np.number])
-            matrix_inputs["Scenarios"] = numeric_scenarios.values.tolist()
-            st.caption(f"Scenarios loaded ({len(numeric_scenarios)} periods).")
-
-        matrix_inputs["x0"] = [1.0 / n_rows] * n_rows
-        
-        with st.expander("Preview Data"):
-            st.dataframe(df_data)
-
-    st.markdown("---")
-    st.subheader("2. Semantic Guide")
-    default_ontology = {
-      "metric_zones": [
-        {
-          "name": "allocation",
-          "description": "Distribution measures, weights or shares in the portfolio.",
-          "examples": ["weight", "active_weight", "allocation", "sum", "sum_all"]
-        },
-        {
-          "name": "performance",
-          "description": "Measures of expected return and yield.",
-          "examples": ["expected_return", "realized_return", "return", "yield"]
-        },
-        {
-          "name": "risk",
-          "description": "Global measures of risk, volatility, and drawdowns.",
-          "examples": ["volatility", "variance", "risk", "sigma", "covariance", "max_drawdown"]
-        },
-        {
-          "name": "extra_financial",
-          "description": "ESG scores and environmental impact metrics like carbon footprint.",
-          "examples": ["esg_score", "esg", "carbon_footprint", "carbon_intensity", "emissions"]
-        }
-      ],
-      "objective_functions": [
-        {"name": "maximize_expected_return", "description": "Maximize the expected return of the portfolio."},
-        {"name": "minimize_variance", "description": "Minimize the portfolio variance or volatility."},
-        {"name": "maximize_sharpe_ratio", "description": "Maximize the risk-adjusted return."},
-        {"name": "pareto_frontier", "description": "Generate a Pareto frontier or trade-off curve between two conflicting objectives.", "examples": ["pareto frontier", "trade-off curve", "efficient frontier", "compromise curve"]}
-      ]
-    }
-    ontology_text = st.text_area("Ontology (JSON):", value=json.dumps(default_ontology, indent=2), height=150)
-    try:
-        ontology_dict = json.loads(ontology_text)
-    except:
-        ontology_dict = default_ontology
-        
-    if st.button("Clear Chat History"):
-        st.session_state.messages = [st.session_state.messages[0]]
-        st.rerun()
-
-# ============================================================
-# MAIN AREA : INTERFACE DE CHAT
-# ============================================================
-st.title("Universal AI Optimization Engine")
-
-# CORRECTION : Boucle enumerate pour garantir des identifiants (keys) uniques
-for i, msg in enumerate(st.session_state.messages):
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if "json" in msg:
-            with st.expander("Inspect generated JSON specification"):
-                st.json(msg["json"])
-        if "fig" in msg:
-            st.plotly_chart(msg["fig"], use_container_width=True, key=f"history_fig_{i}")
-        if "df" in msg:
-            with st.expander("View detailed weights"):
-                numeric_cols = msg["df"].select_dtypes(include=['number']).columns
-                st.dataframe(msg["df"].style.format("{:.4f}", subset=numeric_cols), use_container_width=True)
-        if "diag" in msg:
-            with st.expander("Mathematical Diagnostics (Why did it fail?)", expanded=True):
-                st.markdown(msg["diag"])
-
-if prompt := st.chat_input("Ex: Minimize the portfolio risk using the Sigma matrix..."):
+@st.cache_data
+def generate_mock_data(n_assets=20):
+    np.random.seed(42)
+    tickers = [f"TICK{i:02d}" for i in range(1, n_assets + 1)]
+    sectors = ["Technology", "Financials", "Energy", "Healthcare"] * (n_assets // 4 + 1)
+    esg_scores = np.random.uniform(40, 95, n_assets)
+    expected_returns = np.random.uniform(0.02, 0.15, n_assets)
     
-    if df_data is None:
-        st.warning("Please upload an Excel file in the sidebar first.")
-        st.stop()
+    df_data = pd.DataFrame({
+        "Ticker": tickers,
+        "Sector": sectors[:n_assets],
+        "ESG_Score": esg_scores,
+        "Expected_Return": expected_returns
+    })
+    
+    A = np.random.randn(n_assets, n_assets)
+    sigma = np.dot(A, A.T) / 100 
+    
+    matrix_inputs = {
+        "Variance": sigma.tolist(),
+        "w0": np.full(n_assets, 1.0 / n_assets).tolist(),
+        "Benchmark": np.full(n_assets, 1.0 / n_assets).tolist()
+    }
+    
+    return df_data, matrix_inputs
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+df_data, default_matrix_inputs = generate_mock_data(20)
 
-    with st.chat_message("assistant"):
-        available_columns = df_data.columns.tolist()
-        valid_matrices = [k for k in matrix_inputs.keys() if k != "x0"]
+if "matrix_inputs" not in st.session_state:
+    st.session_state["matrix_inputs"] = default_matrix_inputs
 
-        with st.status("Running Optimization Pipeline...", expanded=True) as status:
+if "objectives" not in st.session_state:
+    st.session_state["objectives"] = [{"type": "quadratic", "target_name": "Variance", "direction": "min", "name": "Minimize Risk"}]
+
+if "constraints" not in st.session_state:
+    st.session_state["constraints"] = [{"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0}]
+
+if "views" not in st.session_state:
+    st.session_state["views"] = []
+
+# ==========================================
+# PAGE HEADER & TABS
+# ==========================================
+st.title("Portfolio Optimization Engine")
+st.markdown("Enterprise-grade interface for Deterministic (CasADi) and Evolutionary (Pymoo) quantitative engines.")
+
+tab_data, tab_config, tab_exec = st.tabs(["Market Data & References", "Objectives & Constraints", "Execution & Results"])
+
+# ==========================================
+# TAB 1 : MARKET DATA & REFERENCES
+# ==========================================
+with tab_data:
+    st.header("Investment Universe")
+    st.dataframe(df_data, use_container_width=True, height=200)
+    
+    st.header("Reference Anchors")
+    col_w0, col_bench = st.columns(2)
+    
+    with col_w0:
+        st.subheader("Initial Weights (w0)")
+        st.info("Required for Turnover constraints. CSV must contain 'Ticker' and 'Weight' columns.")
+        w0_file = st.file_uploader("Upload w0 (CSV)", type=["csv"], key="w0_upload")
+        if w0_file is not None:
+            w0_df = pd.read_csv(w0_file)
+            st.session_state["matrix_inputs"]["w0"] = w0_df["Weight"].tolist()
+            st.success("Initial weights updated.")
             
-            st.write("Step 1: LLM Semantic Translation...")
-            t0 = time.time()
-            try:
-                formulator = FormulationAgent(model=model_name, host=ollama_host, verbose=False)
-                problem = formulator.formulate(
-                    user_request=prompt,
-                    valid_columns=available_columns,
-                    valid_matrices=valid_matrices,
-                    ontology_dict=ontology_dict
-                )
-                config_dict = problem.optimization_config.model_dump()
-                config_json = problem.optimization_config.model_dump_json(indent=2)
-                t1 = time.time()
-                st.write(f"Formulation complete ({t1-t0:.2f}s)")
-            except Exception as e:
-                status.update(label="Pipeline failed at Step 1", state="error")
-                st.error(f"AI interpretation failed: {str(e)}")
-                st.stop()
+    with col_bench:
+        st.subheader("Benchmark Weights")
+        st.info("Required for Tracking Error objectives. CSV must contain 'Ticker' and 'Weight' columns.")
+        bench_file = st.file_uploader("Upload Benchmark (CSV)", type=["csv"], key="bench_upload")
+        if bench_file is not None:
+            bench_df = pd.read_csv(bench_file)
+            st.session_state["matrix_inputs"]["Benchmark"] = bench_df["Weight"].tolist()
+            st.success("Benchmark weights updated.")
 
-            st.write("Step 2: CasADi Algebraic Compilation & Solving...")
-            t2 = time.time()
-            try:
-                executor = OptimizationExecutor(verbose=False)
-                result = executor.run(
-                    optimization_config=config_dict,
-                    matrix_inputs=matrix_inputs,
-                    df_data=df_data
-                )
-                t3 = time.time()
-                st.write(f"Numerical solving complete ({t3-t2:.2f}s)")
-            except Exception as e:
-                status.update(label="Pipeline failed at Step 2", state="error")
-                st.error(f"Solver crashed: {str(e)}")
-                st.stop()
-                
-            total_time = t3 - t0
-            status.update(label=f"Pipeline completed in {total_time:.2f}s", state="complete", expanded=False)
-
-        # --- TRAITEMENT DES RESULTATS ---
-        if result.get("success"):
-            fig = None
-            df_export = None
+# ==========================================
+# TAB 2 : CONFIGURATOR
+# ==========================================
+with tab_config:
+    col_obj, col_cstr, col_views = st.columns(3)
+    
+    # --- OBJECTIVES SECTION ---
+    with col_obj:
+        st.header("Objectives")
+        with st.form("add_obj_form", clear_on_submit=True):
+            obj_target = st.selectbox("Metric", ["Variance", "Expected_Return", "ESG_Score", "Tracking_Error"])
+            obj_dir = st.radio("Direction", ["min", "max"], horizontal=True)
             
-            if result.get("type") == "pareto":
-                assistant_text = f"Pareto Frontier generated with {len(result['pareto_points'])} optimal portfolios!"
-                if result.get("highlight_message"):
-                    assistant_text += f"\n\n{result['highlight_message']}"
+            if st.form_submit_button("Add Objective"):
+                obj_type = "quadratic" if obj_target in ["Variance", "Tracking_Error"] else "linear"
+                st.session_state["objectives"].append({
+                    "type": obj_type,
+                    "target_name": obj_target,
+                    "direction": obj_dir,
+                    "name": f"{obj_dir.capitalize()} {obj_target}"
+                })
+                st.rerun()
                 
-                t1_name = result.get("target_1_name", "Target 1")
-                t2_name = result.get("target_2_name", "Target 2")
-                
-                pareto_data = result["pareto_points"]
-                x_vals = [p["target_2_value"] for p in pareto_data]
-                y_vals = [p["target_1_value"] for p in pareto_data]
-                
-                df_pareto = pd.DataFrame({f"{t2_name}": x_vals, f"{t1_name}": y_vals})
-                
-                first_col = df_data.columns[0]
-                asset_names = df_data[first_col].tolist()
-                for i, asset in enumerate(asset_names):
-                    df_pareto[f"Weight_{asset}"] = [p["weights"][i] * 100 for p in pareto_data]
+        st.markdown("### Active Objectives")
+        for i, obj in enumerate(st.session_state["objectives"]):
+            st.markdown(f"- **{obj['name']}** *(Type: {obj['type']})*")
+            
+        if st.button("Clear Objectives"):
+            st.session_state["objectives"] = []
+            st.rerun()
 
-                fig = px.line(
-                    df_pareto, x=f"{t2_name}", y=f"{t1_name}", markers=True,
-                    hover_data=[f"Weight_{asset}" for asset in asset_names],
-                    title=f"Pareto Frontier ({t2_name} vs {t1_name})"
-                )
-                fig.update_traces(marker=dict(size=12, color="orange", line=dict(width=2, color="DarkSlateGrey")), line=dict(color="royalblue", width=3))
-
-                best_idx = result.get("best_portfolio_index")
-                if best_idx is not None:
-                    fig.add_scatter(x=[x_vals[best_idx]], y=[y_vals[best_idx]], mode='markers', marker=dict(color='red', size=20, symbol='star', line=dict(width=2, color='black')), name='AI Highlight', hoverinfo='skip')
-                df_export = df_pareto
-
+    # --- CONSTRAINTS SECTION ---
+    with col_cstr:
+        st.header("Constraints")
+        with st.form("add_cstr_form", clear_on_submit=True):
+            c_attr = st.selectbox("Attribute", ["sum_all", "element", "min_buy_in", "Sector", "ESG_Score", "Turnover", "exclusion"])
+            
+            if c_attr == "exclusion":
+                c_tickers = st.multiselect("Select Assets to Mutually Exclude", df_data["Ticker"].tolist())
+                c_apply = "b (Binary Selection)"
+                c_strict = True
             else:
-                final_obj_val = result.get('objective', 0)
-                direction = config_dict.get("objective", {}).get("direction", "min")
-                if direction == "max":
-                    final_obj_val = -final_obj_val
-                    
-                assistant_text = f"Optimal solution found! Objective value: **{final_obj_val:.6f}**"
+                c_target = ""
+                if c_attr == "Sector":
+                    c_target = st.selectbox("Target Sector", df_data["Sector"].unique())
                 
-                df_results = df_data.copy()
-                df_results["Optimal_Result_x"] = result["x_values"]
-                df_results["Optimized_Percentage"] = df_results["Optimal_Result_x"] * 100
+                c_type = st.selectbox("Bound Type", ["eq", "max", "min", "range"])
+                
+                if c_type == "range":
+                    c_min_val = st.number_input("Minimum Value", value=0.0, format="%.4f")
+                    c_max_val = st.number_input("Maximum Value", value=1.0, format="%.4f")
+                else:
+                    c_val = st.number_input("Value", value=1.0, format="%.4f")
+                
+                c_strict = st.checkbox("Strict (Hard Constraint)", value=True)
+                
+                c_scale = 1.0
+                if not c_strict:
+                    c_scale = st.number_input("Soft Penalty Scale (Priority)", value=1.0, format="%.2f")
+                    
+                c_apply = st.radio("Apply To", ["x (Weights)", "b (Binary Selection)"], horizontal=True)
+            
+            if st.form_submit_button("Add Constraint"):
+                if c_attr == "exclusion":
+                    if len(c_tickers) >= 2:
+                        st.session_state["constraints"].append({
+                            "constraint_family": "exclusion",
+                            "applied_to": "b",
+                            "set": c_tickers,
+                            "is_strict": True
+                        })
+                else:
+                    applied_to = "b" if "b" in c_apply else "x"
+                    fam = "cardinality" if applied_to == "b" else ("min_buy_in" if c_attr == "min_buy_in" else "standard")
+                    
+                    new_cstr = {
+                        "applied_to": applied_to,
+                        "attribute": c_attr,
+                        "constraint_family": fam,
+                        "is_strict": c_strict,
+                        "bound_type": c_type
+                    }
+                    
+                    if c_type == "range":
+                        new_cstr["min_value"] = c_min_val
+                        new_cstr["max_value"] = c_max_val
+                    else:
+                        new_cstr["value"] = c_val
+                        
+                    if not c_strict:
+                        new_cstr["scale"] = c_scale
+                        
+                    if c_target:
+                        new_cstr["targets"] = [c_target]
+                        
+                    st.session_state["constraints"].append(new_cstr)
+                st.rerun()
+                
+        st.markdown("### Active Constraints")
+        for i, c in enumerate(st.session_state["constraints"]):
+            strict_badge = "[HARD]" if c.get("is_strict", True) else "[SOFT]"
+            if c.get("constraint_family") == "exclusion":
+                st.markdown(f"- {strict_badge} | Mutual Exclusion | Assets: {', '.join(c['set'])}")
+            else:
+                target_str = f" ({c['targets'][0]})" if "targets" in c else ""
+                val_str = f"[{c.get('min_value')} to {c.get('max_value')}]" if c.get("bound_type") == "range" else c.get("value")
+                scale_str = f" (Scale: {c.get('scale')})" if not c.get("is_strict", True) and "scale" in c else ""
+                st.markdown(f"- {strict_badge} | {c['applied_to']} | {c['attribute']}{target_str} {c['bound_type']} {val_str}{scale_str}")
+            
+        if st.button("Reset Constraints"):
+            st.session_state["constraints"] = [{"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0}]
+            st.rerun()
 
-                first_col = df_data.columns[0]
-                fig = px.pie(df_results, values="Optimal_Result_x", names=first_col, hole=0.4, color_discrete_sequence=px.colors.sequential.YlGnBu_r, title="Optimal Asset Allocation")
-                df_export = df_results
+    # --- MARKET VIEWS (BLACK-LITTERMAN) SECTION ---
+    with col_views:
+        st.header("Market Views")
+        st.info("Input absolute return views to dynamically adjust expected returns and covariance prior to optimization.")
+        with st.form("add_view_form", clear_on_submit=True):
+            view_asset = st.selectbox("Target Asset", df_data["Ticker"].tolist())
+            view_return = st.number_input("Expected Absolute Return (e.g., 0.15 for 15%)", value=0.05, format="%.4f")
+            
+            if st.form_submit_button("Add Market View"):
+                st.session_state["views"].append({
+                    "asset": view_asset,
+                    "return": view_return
+                })
+                st.rerun()
+                
+        st.markdown("### Active Views")
+        for i, v in enumerate(st.session_state["views"]):
+            st.markdown(f"- **{v['asset']}**: {v['return']*100:.2f}% expected return")
+            
+        if st.button("Clear Views"):
+            st.session_state["views"] = []
+            st.rerun()
 
-            st.markdown(assistant_text)
-            with st.expander("Inspect generated JSON specification"):
-                st.json(config_json)
-            if fig:
-                # CORRECTION : Utilisation de time.time() pour générer une clé d'affichage unique
-                st.plotly_chart(fig, use_container_width=True, key=f"new_fig_{int(time.time())}")
-            if df_export is not None:
-                with st.expander("View detailed weights"):
-                    numeric_cols = df_export.select_dtypes(include=['number']).columns
-                    st.dataframe(df_export.style.format("{:.4f}", subset=numeric_cols), use_container_width=True)
+# ==========================================
+# TAB 3 : EXECUTION & RESULTS
+# ==========================================
+with tab_exec:
+    st.header("Optimization Execution")
+    
+    with st.expander("Evolutionary Engine Hyperparameters", expanded=False):
+        col_pop, col_gen, col_seed = st.columns(3)
+        pop_size = col_pop.slider("Population Size", min_value=20, max_value=200, value=100, step=10)
+        n_gen = col_gen.slider("Number of Generations", min_value=50, max_value=500, value=150, step=50)
+        seed = col_seed.number_input("Random Seed", value=42)
 
-            st.session_state.messages.append({"role": "assistant", "content": assistant_text, "json": config_json, "fig": fig, "df": df_export})
-
+    optimization_config = {
+        "decision_variables": [
+            {"name": "x", "size": "n_rows", "type": "continuous"},
+            {"name": "b", "size": "n_rows", "type": "binary"}
+        ],
+        "objectives": st.session_state["objectives"],
+        "constraints": st.session_state["constraints"],
+        "moo": {"pop_size": pop_size, "n_gen": n_gen, "seed": seed, "verbose": False}
+    }
+    
+    # Translate UI views to P and Q matrices for Black-Litterman
+    if st.session_state["views"]:
+        n_views = len(st.session_state["views"])
+        n_assets = len(df_data)
+        P_matrix = np.zeros((n_views, n_assets))
+        Q_vector = np.zeros(n_views)
+        ticker_list = df_data["Ticker"].tolist()
+        
+        for i, view in enumerate(st.session_state["views"]):
+            asset_idx = ticker_list.index(view["asset"])
+            P_matrix[i, asset_idx] = 1.0
+            Q_vector[i] = view["return"]
+            
+        optimization_config["black_litterman"] = {
+            "P": P_matrix.tolist(),
+            "Q": Q_vector.tolist(),
+            "tau": 0.05,
+            "rf": 0.0
+        }
+    
+    if st.button("RUN OPTIMIZATION ENGINE", type="primary", use_container_width=True):
+        if not st.session_state["objectives"]:
+            st.error("Please specify at least one objective.")
+            st.stop()
+            
+        with st.spinner("Processing... Routing engine determining optimal solver path..."):
+            executor = OptimizationExecutor(verbose=False)
+            try:
+                res = executor.run(optimization_config, st.session_state["matrix_inputs"], df_data)
+            except Exception as e:
+                st.error(f"Execution Error: {str(e)}")
+                st.stop()
+                
+        st.success(f"Execution Complete. Status: {res.get('status', 'OK')}")
+        
+        if res.get("type") == "pareto":
+            st.subheader(f"Pareto Frontier Analysis ({res.get('algorithm')})")
+            pts = res.get("pareto_points", [])
+            st.metric("Feasible Portfolios Generated", len(pts))
+            
+            if len(pts) > 0:
+                obj_names = pts[0]["objective_names"]
+                soft_names = pts[0].get("soft_constraint_names", [])
+                all_metrics = obj_names + soft_names
+                n_metrics = len(all_metrics)
+                
+                res_data = []
+                for idx, p in enumerate(pts):
+                    row = {"ID": idx}
+                    for i, name in enumerate(obj_names):
+                        val = p["objectives_minimised"][i]
+                        row[name] = -val if st.session_state["objectives"][i]["direction"] == "max" else val
+                    for i, name in enumerate(soft_names):
+                        row[name] = p["soft_losses_raw"][i]
+                    res_data.append(row)
+                    
+                df_res = pd.DataFrame(res_data)
+                
+                col_graph, col_pt = st.columns([2, 1])
+                
+                with col_graph:
+                    if n_metrics == 2:
+                        fig = px.scatter(df_res, x=all_metrics[0], y=all_metrics[1], text="ID", 
+                                         title="2D Efficient Frontier", template="plotly_white")
+                        fig.update_traces(marker=dict(size=10, opacity=0.8), textposition="top center")
+                        st.plotly_chart(fig, use_container_width=True)
+                    elif n_metrics == 3:
+                        fig = px.scatter_3d(df_res, x=all_metrics[0], y=all_metrics[1], z=all_metrics[2],
+                                            color="ID", title="3D Efficient Frontier")
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        fig = px.parallel_coordinates(df_res, color="ID", dimensions=all_metrics,
+                                                      title="Parallel Coordinates Plot (High-Dimensional Frontier)")
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                with col_pt:
+                    st.markdown("**Inspect Specific Portfolio**")
+                    pt_id = st.selectbox("Select Portfolio ID", df_res["ID"].tolist())
+                    selected_w = pts[pt_id]["weights"]
+                    
+                    df_w = pd.DataFrame({"Ticker": df_data["Ticker"], "Weight": selected_w})
+                    df_w = df_w[df_w["Weight"] > 1e-4].sort_values(by="Weight", ascending=False)
+                    
+                    fig_w = px.bar(df_w, x="Ticker", y="Weight", title=f"Composition: Portfolio {pt_id}")
+                    st.plotly_chart(fig_w, use_container_width=True)
+                    
         else:
-            err_status = result.get('status', 'Unknown')
-            err_msg = f"The solver failed to find a solution. Status: **{err_status}**"
-            st.error(err_msg)
+            st.subheader("Deterministic Output (CasADi + SciPy MILP)")
+            st.metric("Optimized Objective Value", round(res.get("objective", 0), 6))
             
-            diag_text = "When the solver returns `Infeasible_Problem_Detected`, it means your constraints mathematically contradict each other.\n\n"
-            diag_text += "**Your Active Constraints:**\n```json\n" + json.dumps(config_dict.get("constraints", []), indent=2) + "\n```\n"
-            
-            constraints = config_dict.get("constraints", [])
-            max_weight_c = next((c for c in constraints if c.get("attribute") == "element" and c.get("max_value") is not None), None)
-            sum_c = next((c for c in constraints if c.get("attribute") in ["sum_all", "sum"] and c.get("bound_type") == "eq"), None)
-            
-            if max_weight_c and sum_c:
-                max_w = max_weight_c.get("max_value")
-                req_sum = sum_c.get("value")
-                if max_w * n_rows < req_sum:
-                    diag_text += f"\nMATH CONTRADICTION DETECTED: You require the total sum to be **{req_sum*100}%**, but you capped individual assets at **{max_w*100}%**. With only **{n_rows} assets**, the absolute maximum you can invest is **{max_w * n_rows * 100}%**. The problem is impossible to solve!"
-            
-            with st.expander("Mathematical Diagnostics (Why did it fail?)", expanded=True):
-                st.markdown(diag_text)
-
-            st.session_state.messages.append({"role": "assistant", "content": err_msg, "diag": diag_text})
+            weights = res.get("x_values", [])
+            if weights:
+                df_w = pd.DataFrame({"Ticker": df_data["Ticker"], "Weight": weights})
+                df_w = df_w[df_w["Weight"] > 1e-4].sort_values(by="Weight", ascending=False)
+                
+                fig = px.bar(df_w, x="Ticker", y="Weight", title="Optimal Portfolio Composition",
+                             color="Weight", color_continuous_scale="Blues")
+                st.plotly_chart(fig, use_container_width=True)
