@@ -2,152 +2,95 @@ import numpy as np
 import pandas as pd
 from src.agent_executor import OptimizationExecutor
 
-# ==========================================
-# 1. GÉNÉRATION DES DONNÉES SYNTHÉTIQUES
-# ==========================================
-np.random.seed(42)
-N = 15
-
-tickers = [f"TICK{i}" for i in range(1, N+1)]
-secteurs = ["Tech", "Finance", "Energy"] * 5
-esg_scores = np.random.uniform(40, 95, N)
-expected_returns = np.random.uniform(0.02, 0.15, N)
-
-df_data = pd.DataFrame({
-    "Ticker": tickers,
-    "Sector": secteurs,
-    "ESG_Score": esg_scores,
-    "Expected_Return": expected_returns
-})
-
-# Matrice de covariance semi-définie positive (A * A.T)
-A = np.random.randn(N, N)
-sigma = np.dot(A, A.T) / 100 
-matrix_inputs = {
-    "Variance": sigma.tolist(),
-    "w0": np.full(N, 1.0/N).tolist()
-}
-
-# Variables de décision standards
-vars_cont = [{"name": "x", "size": "n_rows", "type": "continuous"}]
-vars_mixte = [
-    {"name": "x", "size": "n_rows", "type": "continuous"},
-    {"name": "b", "size": "n_rows", "type": "binary"}
-]
-
-# Config MOO allégée pour des tests rapides
-moo_fast = {"pop_size": 40, "n_gen": 40, "seed": 42, "verbose": False}
-
-# ==========================================
-# 2. SUITE DE TESTS (LES 6 SCÉNARIOS)
-# ==========================================
-test_cases = [
-    {
-        "title": "TEST 1 : Min Variance - Contraintes Continues Uniquement (Déterministe)",
-        "config": {
-            "decision_variables": vars_cont,
-            "objective": {"type": "quadratic", "target_name": "Variance", "direction": "min"},
-            "constraints": [
-                {"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0}
-            ]
-        }
-    },
-    {
-        "title": "TEST 2 : Min Variance - Mixtes (Continues + Binaires) (Déterministe)",
-        "config": {
-            "decision_variables": vars_mixte,
-            "objective": {"type": "quadratic", "target_name": "Variance", "direction": "min"},
-            "constraints": [
-                {"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0},
-                {"applied_to": "b", "attribute": "sum_all", "constraint_family": "cardinality", "is_strict": True, "bound_type": "eq", "value": 5.0},
-                {"applied_to": "x", "attribute": "min_buy_in", "constraint_family": "min_buy_in", "is_strict": True, "bound_type": "min", "min_value": 0.05}
-            ]
-        }
-    },
-    {
-        "title": "TEST 3 : Min Variance & Max Return - Contraintes Continues (MOO)",
-        "config": {
-            "decision_variables": vars_cont,
-            "objectives": [
-                {"type": "quadratic", "target_name": "Variance", "direction": "min", "name": "Risk"},
-                {"type": "linear", "target_name": "Expected_Return", "direction": "max", "name": "Return"}
-            ],
-            "moo": moo_fast,
-            "constraints": [
-                {"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0},
-                {"applied_to": "x", "attribute": "Sector", "targets": ["Tech"], "is_strict": True, "bound_type": "max", "value": 0.4}
-            ]
-        }
-    },
-    {
-        "title": "TEST 4 : Min Variance & Max Return - Mixtes (MOO)",
-        "config": {
-            "decision_variables": vars_mixte,
-            "objectives": [
-                {"type": "quadratic", "target_name": "Variance", "direction": "min", "name": "Risk"},
-                {"type": "linear", "target_name": "Expected_Return", "direction": "max", "name": "Return"}
-            ],
-            "moo": moo_fast,
-            "constraints": [
-                {"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0},
-                {"applied_to": "b", "attribute": "sum_all", "constraint_family": "cardinality", "is_strict": True, "bound_type": "eq", "value": 5.0},
-                {"applied_to": "x", "attribute": "min_buy_in", "constraint_family": "min_buy_in", "is_strict": True, "bound_type": "min", "min_value": 0.05}
-            ]
-        }
-    },
-    {
-        "title": "TEST 5 : Min Variance & Pénalité Soft Continue (ESG) (MOO)",
-        "config": {
-            "decision_variables": vars_mixte,
-            "objective": {"type": "quadratic", "target_name": "Variance", "direction": "min", "name": "Risk"},
-            "moo": moo_fast,
-            "constraints": [
-                {"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0},
-                {"applied_to": "b", "attribute": "sum_all", "constraint_family": "cardinality", "is_strict": True, "bound_type": "eq", "value": 5.0},
-                {"applied_to": "x", "attribute": "ESG_Score", "is_strict": False, "bound_type": "min", "value": 85.0}
-            ]
-        }
-    },
-    {
-        "title": "TEST 6 : Min Variance & Pénalité Soft Binaire (Secteur) (MOO)",
-        "config": {
-            "decision_variables": vars_mixte,
-            "objective": {"type": "quadratic", "target_name": "Variance", "direction": "min", "name": "Risk"},
-            "moo": moo_fast,
-            "constraints": [
-                {"applied_to": "x", "attribute": "sum_all", "is_strict": True, "bound_type": "eq", "value": 1.0},
-                {"applied_to": "b", "attribute": "sum_all", "constraint_family": "cardinality", "is_strict": True, "bound_type": "eq", "value": 5.0},
-                {"applied_to": "b", "attribute": "Sector", "targets": ["Energy"], "constraint_family": "cardinality", "is_strict": False, "bound_type": "max", "value": 1.0}
-            ]
-        }
+def create_mock_data():
+    # Univers de 4 actifs risqués + 1 ligne CASH
+    df_data = pd.DataFrame({
+        "Ticker": ["AAPL", "MSFT", "TSLA", "GOOG", "CASH"],
+        "Expected_Return": [0.08, 0.07, 0.12, 0.06, 0.0],
+        "Sector": ["Tech", "Tech", "Auto", "Tech", "Liquidity"]
+    })
+    
+    # Matrice de covariance factice
+    np.random.seed(42)
+    A = np.random.randn(5, 5)
+    cov = np.dot(A, A.T) / 100
+    cov[4, :] = 0.0 # Le cash n'a pas de volatilité
+    cov[:, 4] = 0.0
+    
+    # Portefeuille initial parfaitement investi (20% sur chaque actif)
+    w0 = [0.20, 0.20, 0.20, 0.20, 0.20]
+    
+    matrix_inputs = {
+        "Variance": cov.tolist(),
+        "w0": w0
     }
-]
+    
+    return df_data, matrix_inputs
 
-# ==========================================
-# 3. EXÉCUTION
-# ==========================================
+def run_tests():
+    df_data, matrix_inputs = create_mock_data()
+    executor = OptimizationExecutor(verbose=True)
+    
+    nav0 = 1_000_000.0
+    inflow = 200_000.0
+
+    print("\n" + "="*60)
+    print("TEST 1 : CASHFLOW CONTINU (CasADi)")
+    print("Objectif : Déployer le numéraire pour maximiser le rendement.")
+    print("="*60)
+    
+    cfg_continuous = {
+        "cashflow": {"nav0": nav0, "amount": inflow},
+        "objective": {"type": "linear", "target_name": "Expected_Return", "direction": "max"},
+        "constraints": []
+    }
+    
+    res_cont = executor.run(cfg_continuous, matrix_inputs, df_data)
+    print(f"Statut : {res_cont.get('status')}")
+    print(f"Poids Finaux : {np.round(res_cont.get('weights_final', []), 4)}")
+    print(f"Trades Nominaux (€) : {np.round(res_cont.get('trades_full_vector', []), 0)}")
+    
+    
+    print("\n" + "="*60)
+    print("TEST 2 : CASHFLOW MIXED-INTEGER (CasADi + SciPy)")
+    print("Objectif : Déployer le numéraire, mais concentrer le portefeuille sur 2 actifs maximum (Cardinalité).")
+    print("="*60)
+    
+    cfg_mip = {
+        "cashflow": {"nav0": nav0, "amount": inflow},
+        "objective": {"type": "linear", "target_name": "Expected_Return", "direction": "max"},
+        "constraints": [
+            {"constraint_family": "cardinality", "applied_to": "b", "attribute": "sum_all", "bound_type": "max", "value": 2.0}
+        ]
+    }
+    
+    res_mip = executor.run(cfg_mip, matrix_inputs, df_data)
+    print(f"Statut : {res_mip.get('status')}")
+    print(f"Poids Finaux : {np.round(res_mip.get('weights_final', []), 4)}")
+    print(f"Sélection Binaire : {res_mip.get('trade_active_binaries', [])}")
+    
+    
+    print("\n" + "="*60)
+    print("TEST 3 : CASHFLOW MULTI-OBJECTIF (Pymoo NSGA-II)")
+    print("Objectif : Minimiser le Risque ET Maximiser le Rendement, sous apport de capital.")
+    print("="*60)
+    
+    cfg_moo = {
+        "cashflow": {"nav0": nav0, "amount": inflow},
+        "objectives": [
+            {"type": "quadratic", "target_name": "Variance", "direction": "min"},
+            {"type": "linear", "target_name": "Expected_Return", "direction": "max"}
+        ],
+        "constraints": [],
+        "moo": {"pop_size": 40, "n_gen": 50, "verbose": False}
+    }
+    
+    res_moo = executor.run(cfg_moo, matrix_inputs, df_data)
+    print(f"Statut : {res_moo.get('status')}")
+    print(f"Portefeuilles Pareto trouvés : {len(res_moo.get('pareto_points', []))}")
+    if res_moo.get('pareto_points'):
+        pt = res_moo['pareto_points'][0]
+        print(f"Exemple Portefeuille 1 - Poids Finaux : {np.round(pt['weights'], 4)}")
+
 if __name__ == "__main__":
-    executor = OptimizationExecutor(verbose=False)
-    for i, test in enumerate(test_cases):
-        print(f"\n{'='*60}\n{test['title']}\n{'='*60}")
-        try:
-            res = executor.run(test["config"], matrix_inputs, df_data)
-            
-            print(f"Statut  : {res.get('status', 'Success')}")
-            
-            if "type" in res and res["type"] == "pareto":
-                pts = res.get("pareto_points", [])
-                print(f"Points Pareto trouvés : {len(pts)}")
-                if pts:
-                    print(f"Objectif 1 (Min/Max)  : [{pts[0]['objectives_minimised'][0]:.4f} ... {pts[-1]['objectives_minimised'][0]:.4f}]")
-                    if res.get("n_soft_constraints", 0) > 0:
-                        print(f"Pénalités Soft (Point 1) : {pts[0]['soft_losses_raw']}")
-            else:
-                x_vals = np.array(res.get("x_values", []))
-                print(f"Objectif (Valeur)     : {res.get('objective', 0.0):.6f}")
-                print(f"Somme des poids       : {np.sum(x_vals):.4f}")
-                if "selection" in res:
-                    print(f"Actifs sélectionnés   : {int(np.sum(res['selection']))}")
-                    
-        except Exception as e:
-            print(f"ERREUR FATALE SUR LE TEST {i+1} : {str(e)}")
+    run_tests()

@@ -5,11 +5,14 @@ from pymoo.optimize import minimize
 
 # Imports alignés sur la nouvelle architecture
 from src.moo.problem import PortfolioMOOProblem
+from src.moo.problem import PortfolioMOOProblemOnly
 from src.moo.repair import PortfolioRepairZandW
+from src.moo.repair import PortfolioRepairWOnly
+
 
 def get_reference_directions(n_obj: int, pop_size: int, seed: int = 1):
     """
-    Génère les directions de référence pour NSGA-III si l'utilisateur 
+    Génère les directions de référence pour NSGA-III si l'utilisateur
     définit plus de 2 dimensions d'exploration (ex: Variance + ESG + Rendement).
     """
     try:
@@ -25,6 +28,25 @@ def get_reference_directions(n_obj: int, pop_size: int, seed: int = 1):
     return get_reference_directions("das-dennis", n_obj, n_partitions=49)
 
 
+def _needs_binary_mode(cfg: dict) -> bool:
+    # 1) Décision variables explicites
+    dv = cfg.get("decision_variables", []) or []
+    for v in dv:
+        if str(v.get("type", "")).lower() == "binary":
+            return True
+
+    # 2) Contraintes qui impliquent une sélection / non-convexité
+    for c in (cfg.get("constraints", []) or []):
+        applied_to = (c.get("applied_to") or "x").lower()
+        fam = str(c.get("constraint_family", "")).lower()
+        if applied_to in ["b", "z"]:
+            return True
+        if fam in ["cardinality", "min_buy_in"]:
+            return True
+
+    return False
+
+
 def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
     """
     Moteur Génétique Multi-Objectif et Soft Constraints.
@@ -34,15 +56,21 @@ def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
     constraints_config = cfg.get("constraints", []) or []
 
     # Instanciation de l'architecture 4 Bacs
-    problem = PortfolioMOOProblem(n_assets, cfg, matrix_inputs, df_data)
-    repair = PortfolioRepairZandW(n_assets, constraints_config, df_data, eps_select=1e-4)
+    binary_mode = _needs_binary_mode(cfg)
+
+    if binary_mode:
+        problem = PortfolioMOOProblem(n_assets, cfg, matrix_inputs, df_data)
+        repair = PortfolioRepairZandW(n_assets, constraints_config, df_data, eps_select=1e-4)
+    else:
+        problem = PortfolioMOOProblemOnly(n_assets, cfg, matrix_inputs, df_data)
+        repair = PortfolioRepairWOnly(n_assets, constraints_config, df_data, eps_select=1e-4)
 
     # Paramétrage de la puissance de calcul
     moo_cfg = cfg.get("moo", {}) or {}
     pop_size = int(moo_cfg.get("pop_size", 100))
     n_gen = int(moo_cfg.get("n_gen", 150))
     seed = int(moo_cfg.get("seed", 42))
-    verbose = bool(moo_cfg.get("verbose", False))
+    verbose = bool(moo_cfg.get("verbose", True))
 
     # Le nombre d'objectifs pour NSGA (M objectifs purs + S soft constraints)
     n_obj = problem.n_obj
@@ -75,49 +103,59 @@ def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
         algorithm,
         ("n_gen", n_gen),
         seed=seed,
-        verbose=verbose
+        verbose=True,
+        copy_algorithm=False
     )
 
     if res.F is None:
         return {"success": False, "status": f"MOO Failed to converge ({algo_name})"}
 
+    # ... [Ton code avant la ligne 120] ...
+    
     F_vals = res.F if res.F.ndim == 2 else res.F.reshape(1, -1)
     X_vals = res.X if res.X.ndim == 2 else res.X.reshape(1, -1)
 
     # Re-calcul silencieux du dernier front pour extraire les valeurs brutes et la matrice G
     tmp_out = {}
     problem._evaluate(X_vals, tmp_out)
-    
+
     raw_soft = tmp_out.get("raw_soft_losses")
     raw_obj = tmp_out.get("raw_objectives")
     G_vals = tmp_out.get("G")
 
+    # Correction de l'attribut : Utiliser problem.n_obj au lieu de problem.M
+    # Attention, problem.n_obj inclut les soft constraints (S). 
+    # Le nombre d'objectifs primaires purs est problem.n_obj - problem.n_s
+    n_primary_objs = problem.n_obj - problem.n_s if hasattr(problem, "n_s") else problem.n_obj
+
     pareto_points = []
     for i in range(len(F_vals)):
-        z = X_vals[i, :n_assets].astype(float)
-        w = X_vals[i, n_assets:].astype(float)
+        if binary_mode:
+            z = X_vals[i, :n_assets].astype(float)
+            w = X_vals[i, n_assets:].astype(float)
+        else:
+            w = X_vals[i, :n_assets].astype(float)
+            z = (w > 1e-4).astype(float)
 
-        # Extraction fine des 4 Bacs pour le front-end
         pt = {
             "objective_names": problem.objective_names,
             "soft_constraint_names": problem.soft_names,
-            
+
             # Métriques (Bac Principal & Bac D)
-            "objectives_minimised": [float(x) for x in F_vals[i, :problem.M]],
+            "objectives_minimised": [float(x) for x in F_vals[i, :n_primary_objs]],
             "objectives_raw": [float(x) for x in (raw_obj[i, :] if raw_obj is not None else [])],
-            "soft_losses_normalised": [float(x) for x in F_vals[i, problem.M:]],
+            
+            # Si des soft constraints existent, elles sont stockées après les objectifs primaires
+            "soft_losses_normalised": [float(x) for x in F_vals[i, n_primary_objs:]] if problem.n_s > 0 else [],
             "soft_losses_raw": [float(x) for x in (raw_soft[i, :] if raw_soft is not None else [])],
-            
-            # Violations (Bac C) - Devraient idéalement toutes valoir <= 0
+
             "hard_nl_violations": [float(x) for x in (G_vals[i, :] if G_vals is not None else [])],
-            
-            # ADN du portefeuille réparé (Bacs A & B)
+
             "weights": w.tolist(),
             "selection": z.tolist(),
         }
         pareto_points.append(pt)
 
-    # Tri cosmétique basé sur le premier objectif principal
     pareto_points.sort(key=lambda d: d["objectives_minimised"][0] if d["objectives_minimised"] else 0.0)
 
     return {
@@ -126,12 +164,11 @@ def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
         "type": "pareto",
         "algorithm": algo_name,
         "ref_dirs": ref_dirs_used,
-        
-        # Statistiques d'architecture
-        "n_objectives_total": int(n_obj),
-        "n_objectives_primary": int(problem.M),
-        "n_soft_constraints": int(problem.S),
-        "n_hard_nl_constraints": int(problem.n_ieq),
-        
+
+        "n_objectives_total": int(problem.n_obj),
+        "n_objectives_primary": int(n_primary_objs),
+        "n_soft_constraints": int(problem.n_s if hasattr(problem, "n_s") else 0),
+        "n_hard_nl_constraints": int(problem.n_ieq_constr),
+
         "pareto_points": pareto_points,
     }

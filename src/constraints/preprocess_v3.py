@@ -2,16 +2,17 @@ import copy
 import numpy as np
 import pandas as pd
 
+
 def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     """
     Pre-treatment v3:
-    A) exclusion/exclusive -> cardinality group
-    B) cardinality group=[tickers] -> df column __grp_k IN/OUT + attribute/targets
-    C) inject epsilon min_buy_in if strict sum(b)=k and no min_buy_in
+      A) exclusion/exclusive -> cardinality group
+      B) cardinality group[tickers] -> df column __grp_k IN/OUT + attribute/targets
+      C) inject epsilon min_buy_in if strict sum(b)=k and no min_buy_in
     Returns: (cfg_preprocessed, df_local)
     """
     cfg = copy.deepcopy(optimization_config)
-    constraints_in = list(cfg.get("constraints", []) or [])
+    constraints_in = list(cfg.get("constraints", [])) or []
     df_local = df_data.copy()
 
     def _norm_ticker(x) -> str:
@@ -20,7 +21,9 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
     def _is_strict(c) -> bool:
         return bool(c.get("is_strict", True))
 
+    # -------------------------------------------------------------------------
     # Pass 1: rewrite exclusion/exclusive -> cardinality group form
+    # -------------------------------------------------------------------------
     constraints_pass1 = []
     for c in constraints_in:
         if not _is_strict(c):
@@ -33,12 +36,12 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
             group_list = c.get("set") or c.get("group") or c.get("assets")
 
             if group_list is None:
-                raise ValueError(f"{fam} requires a 'set' (list of tickers).")
+                raise ValueError(f"'{fam}' requires a 'set' (list of tickers).")
 
             group_norm = [_norm_ticker(t) for t in group_list if str(t).strip() != ""]
             group_norm = list(dict.fromkeys(group_norm))
             if len(group_norm) < 2:
-                raise ValueError(f"{fam} requires at least 2 tickers in 'set'.")
+                raise ValueError(f"'{fam}' requires at least 2 tickers in 'set'.")
 
             c2 = {
                 "constraint_family": "cardinality",
@@ -47,6 +50,7 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
                 "is_strict": True,
                 "_rewritten_from": fam,
             }
+
             if fam == "exclusion":
                 c2["bound_type"] = "max"
                 c2["value"] = 1.0
@@ -58,7 +62,9 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
         else:
             constraints_pass1.append(c)
 
-    # Pass 2: cardinality group=[tickers] -> attribute+targets + df_local col
+    # -------------------------------------------------------------------------
+    # Pass 2: cardinality group[tickers] -> attribute+targets + df_local col
+    # -------------------------------------------------------------------------
     constraints = constraints_pass1
     rewritten_constraints = []
     group_counter = 0
@@ -83,7 +89,7 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
             universe = set(ticker_series_norm.tolist())
             missing = [t for t in group_norm if t not in universe]
             if missing:
-                raise ValueError(f"Cardinality 'group' contains unknown tickers: {missing}")
+                raise ValueError(f"Cardinality 'group' contains unknown tickers: {missing[:10]}")
 
             col_name = f"__grp_{group_counter}"
             group_counter += 1
@@ -101,21 +107,23 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
 
     constraints = rewritten_constraints
 
+    # -------------------------------------------------------------------------
     # Pass 3: inject epsilon min_buy_in if strict sum(b)=k and no min_buy_in
+    # -------------------------------------------------------------------------
     def _is_cardinality_eq_on_b(c):
         if not _is_strict(c):
             return False
-        if c.get("constraint_family", "") != "cardinality":
+        if (c.get("constraint_family") or "") != "cardinality":
             return False
-        if c.get("applied_to", "") != "b":
+        if (c.get("applied_to") or "") != "b":
             return False
-        if c.get("bound_type", "").lower() != "eq":
+        if (c.get("bound_type") or "").lower() != "eq":
             return False
-        attr = c.get("attribute") or c.get("sum_all")
+        attr = (c.get("attribute") or "").lower()
         return attr in ["sum_all", "sum", "somme", "total"]
 
     def _is_min_buy_in(c):
-        return _is_strict(c) and c.get("constraint_family", "") == "min_buy_in"
+        return _is_strict(c) and (c.get("constraint_family") or "") == "min_buy_in"
 
     card_eq_constraints = [c for c in constraints if _is_cardinality_eq_on_b(c)]
     has_min_buy_in = any(_is_min_buy_in(c) for c in constraints)
@@ -128,7 +136,7 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
             raise ValueError(f"Cardinality eq constraint has invalid value: {K}")
 
         if K_int * selection_epsilon > 1.0 + 1e-12:
-            raise ValueError(f"Infeasible: K*epsilon > 1.0")
+            raise ValueError(f"Infeasible: K*epsilon={K_int*selection_epsilon} > 1.0")
 
         constraints.append({
             "applied_to": "x",
@@ -137,7 +145,7 @@ def preprocess_config_and_df_v3(optimization_config: dict, df_data: pd.DataFrame
             "bound_type": "min",
             "min_value": float(selection_epsilon),
             "is_strict": True,
-            "injected": True,
+            "_injected": True,
         })
 
     cfg["constraints"] = constraints
