@@ -1,193 +1,122 @@
+# src/solver_cashflow_v1.py
 import numpy as np
 import pandas as pd
 import casadi as ca
-
 from src.casadi_builder_v3 import CasadiProblemBuilder
-from src.cashflow.forward_model import get_cash_index, build_cashflow_expressions, cashflow_numpy
+from src.cashflow.forward_model import get_cash_indices_by_ccy, build_cashflow_expressions_multi_cash, cashflow_numpy_multi_cash
 
-
-def _ensure_w0_with_cash(matrix_inputs: dict, df_data: pd.DataFrame, cash_idx: int):
-    n_rows = len(df_data)
-    if "w0" not in matrix_inputs:
-        raise ValueError("Cashflow mode requires matrix_inputs['w0'] including CASH weight.")
-    
+def _ensure_w0_full(matrix_inputs: dict, n_rows: int) -> np.ndarray:
     w0 = np.asarray(matrix_inputs["w0"], dtype=float).reshape(-1)
-    
-    if w0.size == n_rows:
-        return w0
-        
-    if w0.size == n_rows - 1:
-        w0_full = np.zeros(n_rows, dtype=float)
-        non_cash_idx = [i for i in range(n_rows) if i != cash_idx]
-        w0_full[non_cash_idx] = w0
-        w0_full[cash_idx] = 1.0 - float(np.sum(w0))
-        return w0_full
-        
-    raise ValueError(f"w0 has invalid length: {w0.size}. Expected {n_rows} or {n_rows-1}.")
+    if not np.isclose(np.sum(w0), 1.0, atol=1e-6): raise ValueError(f"w0 must sum to 1. Got sum={float(np.sum(w0))}")
+    return w0
 
-
-def _ensure_cov_with_cash(matrix_inputs: dict, df_data: pd.DataFrame, cov_key: str = "Variance"):
-    n_rows = len(df_data)
-    if cov_key not in matrix_inputs:
-        return np.eye(n_rows, dtype=float)
-        
-    cov = np.asarray(matrix_inputs[cov_key], dtype=float)
-    if cov.shape == (n_rows, n_rows):
-        return cov
-        
-    if cov.shape == (n_rows - 1, n_rows - 1):
-        cov_full = np.zeros((n_rows, n_rows), dtype=float)
-        cov_full[:n_rows - 1, :n_rows - 1] = cov
-        return cov_full
-        
-    raise ValueError(f"{cov_key} has invalid shape {cov.shape}.")
-
-
-def _ensure_expected_return_with_cash(df_data: pd.DataFrame, cash_idx: int):
-    if "Expected_Return" not in df_data.columns:
-        return df_data
-    df = df_data.copy()
-    if pd.isna(df.loc[cash_idx, "Expected_Return"]):
-        df.loc[cash_idx, "Expected_Return"] = 0.0
-    return df
-
+def _split_constraints_cashflow(cfg_constraints: list):
+    c_x, c_trade = [], []
+    for c in (cfg_constraints or []):
+        applied_to = (c.get("applied_to") or "x").lower().strip()
+        if applied_to in ("b", "z", "t", "t_buy", "t_sell", "tc_total", "cash_pre", "cash_post"): c_trade.append(c)
+        else: c_x.append(c)
+    return c_x, c_trade
 
 def solve_cashflow_optimization(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame, verbose: bool = False) -> dict:
     cashflow_cfg = cfg.get("cashflow") or {}
-    if "amount" not in cashflow_cfg:
-        raise ValueError("cfg['cashflow'] must contain key 'amount'.")
-    if "nav0" not in cashflow_cfg:
-        raise ValueError("cfg['cashflow'] must contain key 'nav0'.")
-        
     amount = float(cashflow_cfg["amount"])
     nav0 = float(cashflow_cfg["nav0"])
-    if nav0 <= 0:
-        raise ValueError("nav0 must be > 0.")
-        
-    cash_idx = get_cash_index(df_data, cash_ticker="CASH")
-    
-    w0 = _ensure_w0_with_cash(matrix_inputs, df_data, cash_idx=cash_idx)
-    if not np.isclose(np.sum(w0), 1.0, atol=1e-6):
-        raise ValueError(f"w0 must sum to 1 (incl CASH). Got sum={float(np.sum(w0))}")
-        
-    cov_full = _ensure_cov_with_cash(matrix_inputs, df_data, cov_key="Variance")
-    matrix_inputs = dict(matrix_inputs)
-    matrix_inputs["Variance"] = cov_full.tolist()
-    
-    df_local = _ensure_expected_return_with_cash(df_data, cash_idx=cash_idx)
-    
-    objectives = cfg.get("objectives", []) or []
-    single_objective = cfg.get("objective")
-    obj_cfg = objectives[0] if objectives else single_objective
-    if obj_cfg is None:
-        obj_cfg = {"type": "quadratic", "target_name": "Variance", "direction": "min", "name": "Min Variance"}
-        
+    base_currency = str(cashflow_cfg.get("base_currency", "USD")).upper().strip()
+    use_foreign_cash = bool(cashflow_cfg.get("use_foreign_cash", True))
+    tc_enabled = bool(cashflow_cfg.get("tc_enabled", False))
+    tc_rate = float(cashflow_cfg.get("tc_rate", 0.0))
+
+    nav1 = float(nav0 + amount)
+    df_local = df_data.copy()
     n_rows = len(df_local)
+    cash_idx_by_ccy = get_cash_indices_by_ccy(df_local)
+    w0 = _ensure_w0_full(matrix_inputs, n_rows)
+    
+    matrix_inputs = dict(matrix_inputs)
+    matrix_inputs["Variance"] = np.asarray(matrix_inputs.get("Variance", np.eye(n_rows)), dtype=float).tolist()
+
+    obj_cfg = (cfg.get("objectives") or [cfg.get("objective")])[0] or {"type": "quadratic", "target_name": "Variance", "direction": "min"}
     builder = CasadiProblemBuilder(n_rows=n_rows)
+    non_cash_idx = df_local.index[df_local["InstrumentType"].astype(str).str.upper().ne("CASH")].astype(int).tolist()
     
     builder.create_variables([
-        {"name": "t", "size": "n_non_cash", "type": "continuous"}
+        {"name": "t_buy", "size": len(non_cash_idx), "type": "continuous"},
+        {"name": "t_sell", "size": len(non_cash_idx), "type": "continuous"}
     ])
-    
-    t_var = builder.vars["t"]
-    
-    fm = build_cashflow_expressions(
-        trades_t=t_var,
-        w0=w0,
-        nav0=nav0,
-        cashflow_amount=amount,
-        cash_idx=cash_idx
+    builder.add_constraint(builder.vars["t_buy"], 0.0, ca.inf)
+    builder.add_constraint(builder.vars["t_sell"], 0.0, ca.inf)
+
+    t_fx_out_by_ccy, t_fx_in_by_ccy = {}, {}
+    for ccy in cash_idx_by_ccy.keys():
+        if ccy == base_currency: continue
+        builder.create_variables([{"name": f"t_fx_out_{ccy}", "size": 1, "type": "continuous"}, {"name": f"t_fx_in_{ccy}", "size": 1, "type": "continuous"}])
+        t_fx_out_by_ccy[ccy] = builder.vars[f"t_fx_out_{ccy}"]
+        t_fx_in_by_ccy[ccy] = builder.vars[f"t_fx_in_{ccy}"]
+        builder.add_constraint(t_fx_out_by_ccy[ccy], 0.0, ca.inf)
+        builder.add_constraint(t_fx_in_by_ccy[ccy], 0.0, ca.inf)
+
+    fm = build_cashflow_expressions_multi_cash(
+        t_buy=builder.vars["t_buy"], t_sell=builder.vars["t_sell"],
+        t_fx_out_by_ccy=t_fx_out_by_ccy, t_fx_in_by_ccy=t_fx_in_by_ccy,
+        w0=w0, nav0=nav0, cashflow_amount=amount, df_data=df_local, base_currency=base_currency, tc_enabled=tc_enabled, tc_rate=tc_rate
     )
-    
-    w1_expr = fm["w1"]
-    v1_expr = fm["v1"]
-    cash1_expr = fm["cash1"]
-    non_cash_idx = fm["non_cash_idx"]
-    
-    builder.set_evaluation_expression("x", w1_expr)
-    builder.set_evaluation_expression("w", w1_expr)
-    builder.set_evaluation_expression("w_final", w1_expr)
-    
-    v1_non_cash = ca.vertcat(*[v1_expr[i] for i in non_cash_idx])
-    builder.add_constraint(v1_non_cash, 0.0, ca.inf)
-    builder.add_constraint(cash1_expr, 0.0, ca.inf)
-    
-    constraints = cfg.get("constraints", []) or []
-    builder.apply_smart_constraints(constraints, df_local, matrix_inputs)
-    
+
+    for k, v in [("x", fm["w1_expo"]), ("w", fm["w1_expo"]), ("w_bilan", fm["w1_bilan"]), ("t", fm["t_net"]), ("t_buy", builder.vars["t_buy"]), ("t_sell", builder.vars["t_sell"])]:
+        builder.set_evaluation_expression(k, v)
+
+    df_trade = df_local.iloc[non_cash_idx].reset_index(drop=True)
+
+    # BLOCAGE DES FLUX FX (WASH-TRADE)
+    if not use_foreign_cash:
+        idx_nb = np.where(df_trade["Currency"].astype(str).str.upper().str.strip().ne(base_currency).to_numpy())[0].tolist()
+        if idx_nb:
+            builder.add_constraint(builder.vars["t_buy"][idx_nb], 0.0, 0.0)
+            builder.add_constraint(builder.vars["t_sell"][idx_nb], 0.0, 0.0)
+        for ccy in cash_idx_by_ccy.keys():
+            if ccy != base_currency:
+                builder.add_constraint(builder.vars[f"t_fx_out_{ccy}"], 0.0, 0.0)
+                builder.add_constraint(builder.vars[f"t_fx_in_{ccy}"], 0.0, 0.0)
+
+    # INDEXATION DIRECTE AU LIEU DE VERTCAT
+    builder.add_constraint(fm["v1_bilan"][non_cash_idx], 0.0, ca.inf)
+
+    for ccy, expr_pre in fm["cash_pre_by_ccy"].items():
+        builder.add_constraint(fm["cash_post_by_ccy"][ccy] if tc_enabled else expr_pre, 0.0, ca.inf)
+
+    c_x, c_t = _split_constraints_cashflow(cfg.get("constraints", []))
+    builder.apply_smart_constraints(c_x, df_local, matrix_inputs)
+    builder.apply_smart_constraints(c_t, df_trade, None)
+
     obj_cfg = dict(obj_cfg)
     obj_cfg.setdefault("variable_name", "x")
     builder.build_objective(obj_cfg, matrix_inputs, df_local)
-    
-    nlp = builder.build_nlp()
-    opts = {
-        "ipopt.print_level": 0,
-        "print_time": 0,
-        "ipopt.tol": 1e-7,
-        "ipopt.max_iter": 2000
-    }
-    
-    solver = ca.nlpsol("cashflow_solver", "ipopt", nlp, opts)
-    
-    x0 = np.zeros(int(t_var.size1()), dtype=float)
-    
-    sol = solver(
-        x0=x0,
-        lbx=builder.lbx,
-        ubx=builder.ubx,
-        lbg=builder.lbg,
-        ubg=builder.ubg
-    )
-    
-    stats = solver.stats()
-    if not stats.get("success", False):
-        return {
-            "success": False,
-            "status": stats.get("return_status", "Unknown"),
-        }
-        
+
+    # HESSIAN APPROXIMATION MAGIQUE (INSTANTANÉ)
+    opts = {"ipopt.print_level": 0, "print_time": 0, "ipopt.tol": 1e-7, "ipopt.max_iter": 2000, "ipopt.hessian_approximation": "limited-memory"}
+    solver = ca.nlpsol("solver", "ipopt", builder.build_nlp(), opts)
+
+    x0 = np.zeros(len(builder.lbx), dtype=float)
+    sol = solver(x0=x0, lbx=builder.lbx, ubx=builder.ubx, lbg=builder.lbg, ubg=builder.ubg)
+
+    if not solver.stats().get("success", False): return {"success": False, "status": solver.stats().get("return_status", "Unknown")}
+
     x_opt = np.array(sol["x"]).reshape(-1)
-    t_s, t_e = builder.var_indices["t"]
-    t_opt = x_opt[t_s:t_e].astype(float)
+    t_buy_opt = x_opt[builder.var_indices["t_buy"][0]:builder.var_indices["t_buy"][1]]
+    t_sell_opt = x_opt[builder.var_indices["t_sell"][0]:builder.var_indices["t_sell"][1]]
     
-    rep = cashflow_numpy(
-        trades_t=t_opt,
-        w0=w0,
-        nav0=nav0,
-        cashflow_amount=amount,
-        cash_idx=cash_idx
-    )
-    
-    w1 = rep["w1"]
-    v1 = rep["v1"]
-    nav1 = rep["nav1"]
-    cash1 = rep["cash1"]
+    t_fx_out_opt = {ccy: float(x_opt[builder.var_indices[f"t_fx_out_{ccy}"][0]]) for ccy in cash_idx_by_ccy if ccy != base_currency}
+    t_fx_in_opt = {ccy: float(x_opt[builder.var_indices[f"t_fx_in_{ccy}"][0]]) for ccy in cash_idx_by_ccy if ccy != base_currency}
+
+    rep = cashflow_numpy_multi_cash(t_buy=t_buy_opt, t_sell=t_sell_opt, t_fx_out_by_ccy=t_fx_out_opt, t_fx_in_by_ccy=t_fx_in_opt, w0=w0, nav0=nav0, cashflow_amount=amount, df_data=df_local, base_currency=base_currency, tc_enabled=tc_enabled, tc_rate=tc_rate)
     
     full_trades = np.zeros(n_rows, dtype=float)
-    for k, idx in enumerate(non_cash_idx):
-        full_trades[idx] = t_opt[k]
-    full_trades[cash_idx] = -float(np.sum(t_opt))
-    
+    full_trades[non_cash_idx] = rep["t_net"]
+
     return {
-        "success": True,
-        "status": "Cashflow Optimisation Completed",
-        "type": "cashflow_single_objective",
-        "objective": float(sol["f"]),
-        "nav0": float(nav0),
-        "cashflow_amount": float(amount),
-        "nav1": float(nav1),
-        
-        "cash_index": int(cash_idx),
-        "cash_final_value": float(cash1),
-        "cash_final_weight": float(w1[cash_idx]),
-        
-        "weights_initial": w0.tolist(),
-        "weights_final": w1.tolist(),
-        
-        "trades_non_cash": t_opt.tolist(),
-        "trades_full_vector": full_trades.tolist(),
-        
-        "positions_final_value": v1.tolist(),
-        "sum_trades_non_cash": float(np.sum(t_opt)),
-        "tickers": df_local["Ticker"].astype(str).tolist(),
+        "success": True, "status": "Completed", "type": "cashflow_single",
+        "objective": float(sol["f"]), "nav0": nav0, "cashflow_amount": amount, "nav1": rep["nav1"],
+        "weights_final": rep["w1_expo"].tolist(), "weights_bilan_final": rep["w1_bilan"].tolist(),
+        "trades_net": rep["t_net"].tolist(), "tc_total": float(rep["tc_total"]),
+        "trades_full_vector_pre_cost": full_trades.tolist()
     }

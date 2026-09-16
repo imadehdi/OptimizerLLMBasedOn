@@ -1,96 +1,189 @@
 import numpy as np
 import pandas as pd
+import warnings
+
+# Suppression des warnings Pandas pour un affichage propre
+warnings.filterwarnings('ignore')
 from src.agent_executor import OptimizationExecutor
 
-def create_mock_data():
-    # Univers de 4 actifs risqués + 1 ligne CASH
-    df_data = pd.DataFrame({
-        "Ticker": ["AAPL", "MSFT", "TSLA", "GOOG", "CASH"],
-        "Expected_Return": [0.08, 0.07, 0.12, 0.06, 0.0],
-        "Sector": ["Tech", "Tech", "Auto", "Tech", "Liquidity"]
+
+# =====================================================================
+# 1. GÉNÉRATION DE L'UNIVERS (Données Synthétiques Rigoureuses)
+# =====================================================================
+def generate_institutional_universe(n_assets=250):
+    np.random.seed(42)
+    
+    n_standard = n_assets - 3 # On garde 3 places pour le cash
+    tickers = [f"TICKER_{i:03d}" for i in range(n_standard)]
+    
+    # Mix institutionnel : 60% Actions, 30% Obligations, 10% Dérivés
+    types = np.random.choice(["EQUITY", "BOND", "DERIVATIVE"], size=n_standard, p=[0.6, 0.3, 0.1])
+    currencies = np.random.choice(["USD", "EUR", "GBP"], size=n_standard, p=[0.7, 0.2, 0.1])
+    
+    df = pd.DataFrame({
+        "Ticker": tickers,
+        "InstrumentType": types,
+        "Currency": currencies,
+        "Sector": np.random.choice(["Tech", "Health", "Fin", "Energy", "Cons"], size=n_standard),
+        "Expected_Return": np.random.normal(0.06, 0.15, n_standard),
     })
     
-    # Matrice de covariance factice
-    np.random.seed(42)
-    A = np.random.randn(5, 5)
-    cov = np.dot(A, A.T) / 100
-    cov[4, :] = 0.0 # Le cash n'a pas de volatilité
-    cov[:, 4] = 0.0
+    # Ajout des poches de liquidité (Obligatoires pour le multi-devises)
+    cash_data = pd.DataFrame({
+        "Ticker": ["CASH_USD", "CASH_EUR", "CASH_GBP"],
+        "InstrumentType": ["CASH", "CASH", "CASH"],
+        "Currency": ["USD", "EUR", "GBP"],
+        "Sector": ["Cash", "Cash", "Cash"],
+        "Expected_Return": [0.03, 0.02, 0.04],
+    })
+    df = pd.concat([df, cash_data], ignore_index=True)
     
-    # Portefeuille initial parfaitement investi (20% sur chaque actif)
-    w0 = [0.20, 0.20, 0.20, 0.20, 0.20]
+    # --- Modélisation Financière Avancée ---
+    # Cash_Impact : 0.0 pour les dérivés (ils ne consomment pas de cash à l'achat)
+    df["Cash_Impact"] = np.where(df["InstrumentType"] == "DERIVATIVE", 0.0, 1.0)
+    df["Exposure"] = 1.0 
+    
+    fx_rates = {"USD": 1.0, "EUR": 1.1, "GBP": 1.25} # Base = USD
+    df["FXRateToBase"] = df["Currency"].map(fx_rates)
+    df["FX_Spread"] = 0.0005 # 5 bps de spread FX
+    
+    n_total = len(df)
+    
+    # Matrice de Covariance (Semi-définie positive stricte)
+    factor = np.random.randn(n_total, 5)
+    cov_matrix = np.dot(factor, factor.T) * 0.02
+    np.fill_diagonal(cov_matrix, cov_matrix.diagonal() + 0.05)
+    
+    # Portefeuille initial (w0) : 100% investi, 0% dérivés initialement
+    w0 = np.random.uniform(0, 1, n_total)
+    w0[df["InstrumentType"] == "DERIVATIVE"] = 0.0
+    w0 = w0 / np.sum(w0)
+    
+    # Benchmark
+    benchmark = np.random.uniform(0, 1, n_total)
+    benchmark = benchmark / np.sum(benchmark)
     
     matrix_inputs = {
-        "Variance": cov.tolist(),
-        "w0": w0
+        "Variance": cov_matrix.tolist(),
+        "w0": w0.tolist(),
+        "Benchmark": benchmark.tolist()
     }
     
-    return df_data, matrix_inputs
+    return df, matrix_inputs
 
+# =====================================================================
+# 2. FONCTION D'AFFICHAGE D'AUDIT
+# =====================================================================
+def print_audit_report(res, title):
+    print(f"\n{'='*60}")
+    print(f" RESULTATS : {title}")
+    print(f"{'='*60}")
+    
+    if not res.get("success"):
+        print(f"[ECHEC] Raison : {res.get('status')}")
+        return
+        
+    print(f"Status Solveur : {res.get('status')}")
+    print(f"Moteur Utilisé : {res.get('type')}")
+    print(f"NAV Initiale   : {res.get('nav0'):,.0f} $")
+    print(f"Cashflow       : {res.get('cashflow_amount'):,.0f} $")
+    print(f"NAV Finale     : {res.get('nav1'):,.0f} $")
+    
+    if "tc_total" in res:
+        print(f"Frais Titres   : {res.get('tc_total'):,.0f} $")
+        
+    if "n_trades_active" in res:
+        print(f"Nb de Trades   : {res.get('n_trades_active')} actifs touchés")
+        
+    # Analyse de la conservation du budget
+    w_expo = np.sum(res.get("weights_final", []))
+    w_bilan = np.sum(res.get("weights_bilan_final", []))
+    print(f"\nSomme (Exposure): {w_expo:.6f} (Doit faire 1.0 ou s'en approcher)")
+    print(f"Somme (Bilan)   : {w_bilan:.6f} (Doit faire 1.0 strictement)")
+    
+    print("\n--- Top 5 des Transactions Nettes (USD) ---")
+    trades = np.array(res.get("trades_net", []))
+    active_indices = np.argsort(np.abs(trades))[::-1][:5]
+    for idx in active_indices:
+        t_val = trades[idx]
+        if abs(t_val) > 1e-2:
+            direction = "ACHAT" if t_val > 0 else "VENTE"
+            print(f"Index {idx:03d} | {direction} : {abs(t_val):,.0f} $")
+
+# =====================================================================
+# 3. SCÉNARIOS DE TESTS
+# =====================================================================
 def run_tests():
-    df_data, matrix_inputs = create_mock_data()
-    executor = OptimizationExecutor(verbose=True)
+    print("Génération de l'univers de 250 actifs (Actions, Bonds, Dérivés, Cash FX)...")
+    df_data, matrix_inputs = generate_institutional_universe(250)
+    executor = OptimizationExecutor(verbose=False)
     
-    nav0 = 1_000_000.0
-    inflow = 200_000.0
+    nav_initiale = 100_000_000.0 # 100 Millions USD
 
-    print("\n" + "="*60)
-    print("TEST 1 : CASHFLOW CONTINU (CasADi)")
-    print("Objectif : Déployer le numéraire pour maximiser le rendement.")
-    print("="*60)
-    
-    cfg_continuous = {
-        "cashflow": {"nav0": nav0, "amount": inflow},
-        "objective": {"type": "linear", "target_name": "Expected_Return", "direction": "max"},
-        "constraints": []
-    }
-    
-    res_cont = executor.run(cfg_continuous, matrix_inputs, df_data)
-    print(f"Statut : {res_cont.get('status')}")
-    print(f"Poids Finaux : {np.round(res_cont.get('weights_final', []), 4)}")
-    print(f"Trades Nominaux (€) : {np.round(res_cont.get('trades_full_vector', []), 0)}")
-    
-    
-    print("\n" + "="*60)
-    print("TEST 2 : CASHFLOW MIXED-INTEGER (CasADi + SciPy)")
-    print("Objectif : Déployer le numéraire, mais concentrer le portefeuille sur 2 actifs maximum (Cardinalité).")
-    print("="*60)
-    
-    cfg_mip = {
-        "cashflow": {"nav0": nav0, "amount": inflow},
-        "objective": {"type": "linear", "target_name": "Expected_Return", "direction": "max"},
+    # -----------------------------------------------------------------
+    # TEST 1 : INFLOW MASSIF + CONTINU + FX
+    # Modélise une injection de 10M$ à réinvestir avec minimisation de la Tracking Error.
+    # Aucun binaire utilisé, l'algo CasADi classique est appelé.
+    # -----------------------------------------------------------------
+    print("\n[Lancement du Test 1] - Inflow Continu (10M$)")
+    cfg_test_1 = {
+        "cashflow": {
+            "nav0": nav_initiale,
+            "amount": 10_000_000.0,
+            "base_currency": "USD",
+            "tc_enabled": True,
+            "tc_rate": 0.0010, # 10 bps
+            "use_foreign_cash": True
+        },
+        "objective": {
+            "type": "tracking_error",
+            "target_name": "Variance",
+            "direction": "min"
+        },
         "constraints": [
-            {"constraint_family": "cardinality", "applied_to": "b", "attribute": "sum_all", "bound_type": "max", "value": 2.0}
+            {"is_strict": True, "applied_to": "x", "attribute": "element", "bound_type": "min", "value": 0.0} # Long Only
         ]
     }
-    
-    res_mip = executor.run(cfg_mip, matrix_inputs, df_data)
-    print(f"Statut : {res_mip.get('status')}")
-    print(f"Poids Finaux : {np.round(res_mip.get('weights_final', []), 4)}")
-    print(f"Sélection Binaire : {res_mip.get('trade_active_binaries', [])}")
-    
-    
-    print("\n" + "="*60)
-    print("TEST 3 : CASHFLOW MULTI-OBJECTIF (Pymoo NSGA-II)")
-    print("Objectif : Minimiser le Risque ET Maximiser le Rendement, sous apport de capital.")
-    print("="*60)
-    
-    cfg_moo = {
-        "cashflow": {"nav0": nav0, "amount": inflow},
-        "objectives": [
-            {"type": "quadratic", "target_name": "Variance", "direction": "min"},
-            {"type": "linear", "target_name": "Expected_Return", "direction": "max"}
-        ],
-        "constraints": [],
-        "moo": {"pop_size": 40, "n_gen": 50, "verbose": False}
+    res_1 = executor.run(cfg_test_1, matrix_inputs, df_data)
+    print_audit_report(res_1, "TEST 1 : Cashflow Continu (TE Minimisation)")
+
+
+    # -----------------------------------------------------------------
+    # TEST 2 : OUTFLOW + MIP (CARDINALITÉ & MIN TICKET)
+    # Modélise un rachat de 5M$. Le gérant veut lever ce cash en liquidant 
+    # ou réduisant un MAXIMUM de 10 lignes (Cardinalité), avec des ordres
+    # d'au moins 200 000 $ par ligne (Min Ticket) pour éviter de saupoudrer.
+    # -----------------------------------------------------------------
+    print("\n[Lancement du Test 2] - Outflow MIP (Rachat 5M$, Max 10 trades, Ticket > 200k$)")
+    cfg_test_2 = {
+        "cashflow": {
+            "nav0": nav_initiale,
+            "amount": -5_000_000.0,
+            "base_currency": "USD",
+            "tc_enabled": True,
+            "tc_rate": 0.0015, # 15 bps
+            "use_foreign_cash": True
+        },
+        "objective": {
+            "type": "tracking_error",
+            "target_name": "Variance",
+            "direction": "min"
+        },
+        "constraints": [
+            {"is_strict": True, "applied_to": "x", "attribute": "element", "bound_type": "min", "value": 0.0},
+            
+            # Limite mathématique stricte sur la variable binaire d'action (z / b)
+            {"is_strict": True, "applied_to": "b", "constraint_family": "cardinality", 
+             "attribute": "sum_all", "bound_type": "max", "value": 10},
+             
+            # Seuil d'action (Min Ticket) : 200k$ divisé par la nouvelle NAV
+            {"is_strict": True, "applied_to": "b", "constraint_family": "min_ticket", 
+             "min_value": 200_000.0 / (nav_initiale - 5_000_000.0)}
+        ]
     }
-    
-    res_moo = executor.run(cfg_moo, matrix_inputs, df_data)
-    print(f"Statut : {res_moo.get('status')}")
-    print(f"Portefeuilles Pareto trouvés : {len(res_moo.get('pareto_points', []))}")
-    if res_moo.get('pareto_points'):
-        pt = res_moo['pareto_points'][0]
-        print(f"Exemple Portefeuille 1 - Poids Finaux : {np.round(pt['weights'], 4)}")
+    # L'Aiguilleur (agent_executor.py) détectera le "b" et la "cardinality" et routra vers solve_cashflow_mip_optimization
+    res_2 = executor.run(cfg_test_2, matrix_inputs, df_data)
+    print_audit_report(res_2, "TEST 2 : Cashflow MIP (Rachats Concentrés)")
 
 if __name__ == "__main__":
     run_tests()

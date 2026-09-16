@@ -1,3 +1,4 @@
+# src/moo/solver.py
 import numpy as np
 import pandas as pd
 from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -11,10 +12,6 @@ from src.moo.repair import PortfolioRepairWOnly
 
 
 def get_reference_directions(n_obj: int, pop_size: int, seed: int = 1):
-    """
-    Génère les directions de référence pour NSGA-III si l'utilisateur
-    définit plus de 2 dimensions d'exploration (ex: Variance + ESG + Rendement).
-    """
     try:
         from pymoo.util.ref_dirs import get_reference_directions
     except ImportError as e:
@@ -29,13 +26,11 @@ def get_reference_directions(n_obj: int, pop_size: int, seed: int = 1):
 
 
 def _needs_binary_mode(cfg: dict) -> bool:
-    # 1) Décision variables explicites
     dv = cfg.get("decision_variables", []) or []
     for v in dv:
         if str(v.get("type", "")).lower() == "binary":
             return True
 
-    # 2) Contraintes qui impliquent une sélection / non-convexité
     for c in (cfg.get("constraints", []) or []):
         applied_to = (c.get("applied_to") or "x").lower()
         fam = str(c.get("constraint_family", "")).lower()
@@ -48,31 +43,25 @@ def _needs_binary_mode(cfg: dict) -> bool:
 
 
 def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
-    """
-    Moteur Génétique Multi-Objectif et Soft Constraints.
-    Implémente NSGA-II / NSGA-III avec le Repair Operator Hybride (MILP + SLSQP).
-    """
     n_assets = len(df_data)
     constraints_config = cfg.get("constraints", []) or []
 
-    # Instanciation de l'architecture 4 Bacs
     binary_mode = _needs_binary_mode(cfg)
 
+    # NOUVEAU : Transmission de cfg et matrix_inputs aux opérateurs de Repair
     if binary_mode:
         problem = PortfolioMOOProblem(n_assets, cfg, matrix_inputs, df_data)
-        repair = PortfolioRepairZandW(n_assets, constraints_config, df_data, eps_select=1e-4)
+        repair = PortfolioRepairZandW(n_assets, cfg, matrix_inputs, df_data, eps_select=1e-4)
     else:
         problem = PortfolioMOOProblemOnly(n_assets, cfg, matrix_inputs, df_data)
-        repair = PortfolioRepairWOnly(n_assets, constraints_config, df_data, eps_select=1e-4)
+        repair = PortfolioRepairWOnly(n_assets, cfg, matrix_inputs, df_data, eps_select=1e-4)
 
-    # Paramétrage de la puissance de calcul
     moo_cfg = cfg.get("moo", {}) or {}
     pop_size = int(moo_cfg.get("pop_size", 100))
     n_gen = int(moo_cfg.get("n_gen", 150))
     seed = int(moo_cfg.get("seed", 42))
     verbose = bool(moo_cfg.get("verbose", True))
 
-    # Le nombre d'objectifs pour NSGA (M objectifs purs + S soft constraints)
     n_obj = problem.n_obj
 
     if n_obj <= 2:
@@ -97,25 +86,21 @@ def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
         algo_name = "NSGA3"
         ref_dirs_used = {"n_obj": int(n_obj), "n_ref_dirs": int(len(ref_dirs))}
 
-    # Lancement de l'évolution
     res = minimize(
         problem,
         algorithm,
         ("n_gen", n_gen),
         seed=seed,
-        verbose=True,
+        verbose=verbose,
         copy_algorithm=False
     )
 
     if res.F is None:
         return {"success": False, "status": f"MOO Failed to converge ({algo_name})"}
 
-    # ... [Ton code avant la ligne 120] ...
-    
     F_vals = res.F if res.F.ndim == 2 else res.F.reshape(1, -1)
     X_vals = res.X if res.X.ndim == 2 else res.X.reshape(1, -1)
 
-    # Re-calcul silencieux du dernier front pour extraire les valeurs brutes et la matrice G
     tmp_out = {}
     problem._evaluate(X_vals, tmp_out)
 
@@ -123,9 +108,6 @@ def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
     raw_obj = tmp_out.get("raw_objectives")
     G_vals = tmp_out.get("G")
 
-    # Correction de l'attribut : Utiliser problem.n_obj au lieu de problem.M
-    # Attention, problem.n_obj inclut les soft constraints (S). 
-    # Le nombre d'objectifs primaires purs est problem.n_obj - problem.n_s
     n_primary_objs = problem.n_obj - problem.n_s if hasattr(problem, "n_s") else problem.n_obj
 
     pareto_points = []
@@ -141,11 +123,9 @@ def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
             "objective_names": problem.objective_names,
             "soft_constraint_names": problem.soft_names,
 
-            # Métriques (Bac Principal & Bac D)
             "objectives_minimised": [float(x) for x in F_vals[i, :n_primary_objs]],
             "objectives_raw": [float(x) for x in (raw_obj[i, :] if raw_obj is not None else [])],
             
-            # Si des soft constraints existent, elles sont stockées après les objectifs primaires
             "soft_losses_normalised": [float(x) for x in F_vals[i, n_primary_objs:]] if problem.n_s > 0 else [],
             "soft_losses_raw": [float(x) for x in (raw_soft[i, :] if raw_soft is not None else [])],
 
@@ -164,11 +144,9 @@ def solve_moo(cfg: dict, matrix_inputs: dict, df_data: pd.DataFrame) -> dict:
         "type": "pareto",
         "algorithm": algo_name,
         "ref_dirs": ref_dirs_used,
-
         "n_objectives_total": int(problem.n_obj),
         "n_objectives_primary": int(n_primary_objs),
         "n_soft_constraints": int(problem.n_s if hasattr(problem, "n_s") else 0),
         "n_hard_nl_constraints": int(problem.n_ieq_constr),
-
         "pareto_points": pareto_points,
     }
